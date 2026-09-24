@@ -7,11 +7,73 @@ import ipaddress
 #politicas de cabecera 
 from dataclasses import dataclass, field
 import json 
+from mcp.server.fastmcp import FastMCP, Context
 
 
-mcp = FastMCP("mcp-web", stateless_http=True)
+# Valores por defecto de los limites, usados solo si la politica
+# declarada no especifica alguno. No hay default para 'hosts':
+# sin hosts la tool no opera (falla cerrada).
+LIMITES_POR_DEFECTO = {
+    "bytes_recibidos": 5_242_880,
+    "bytes_descomprimidos": 20_971_520,
+    "timeout_peticion_s": 30,
+    "timeout_total_s": 60,
+    "max_saltos": 5,
+    "max_chars_devueltos": 15_000,
+}
 
-MAX_REDIRECCIONES = 5
+class PoliticaInvalida(Exception):
+    """La politica declarada esta ausente, mal formada o sin destinos."""
+
+@dataclass
+class PoliticaEgreso:
+    """Politica de salida declarada por quien invoca la tool."""
+    hosts: list[str]
+    incluir_subdominios: bool = False
+    esquemas: list[str] = field(default_factory=lambda: ["https"])
+    limites: dict = field(default_factory=lambda: dict(LIMITES_POR_DEFECTO))
+    derivadas: dict = field(default_factory=lambda: {"seguir": False,
+                                                    "solo_misma_allowlist": True})
+    crudo: dict = field(default_factory=dict)
+
+    @classmethod
+    def desde_json(cls, texto: str | None) -> "PoliticaEgreso":
+        if texto is None or texto.strip() == "":
+            raise PoliticaInvalida("politica de salida no declarada")
+
+        try:
+            datos = json.loads(texto)
+        except json.JSONDecodeError:
+            raise PoliticaInvalida("politica de salida mal formada (JSON invalido)")
+
+        if not isinstance(datos, dict):
+            raise PoliticaInvalida("politica de salida mal formada (se esperaba un objeto)")
+
+        hosts = datos.get("hosts")
+        if not hosts or not isinstance(hosts, list):
+            raise PoliticaInvalida("politica sin destinos permitidos")
+
+        limites = dict(LIMITES_POR_DEFECTO)
+        limites.update(datos.get("limites") or {})
+
+        return cls(
+            hosts=[h.lower() for h in hosts],
+            incluir_subdominios=bool(datos.get("incluir_subdominios", False)),
+            esquemas=datos.get("esquemas") or ["https"],
+            limites=limites,
+            derivadas=datos.get("derivadas") or {"seguir": False,
+                                                 "solo_misma_allowlist": True},
+            crudo=datos,
+        )
+
+    def host_permitido(self, host: str) -> bool:
+        host = host.lower()
+        for permitido in self.hosts:
+            if host == permitido:
+                return True
+            if self.incluir_subdominios and host.endswith("." + permitido):
+                return True
+        return False
 
 # Tipos de las dependencias inyectables
 # cualquier funcion que recibe un host (devuelve IPs)
@@ -59,13 +121,26 @@ def resolver_ip_segura(host: str, resolver: Resolver) -> tuple[str | None, str |
     return ips[0], None
 
 
-def validar_esquema(url: str) -> str | None:
-    """Valida esquema y presencia de host."""
+def validar_url_contra_politica(url: str, politica: PoliticaEgreso) -> str | None:
+    """
+    Valida esquema, credenciales embebidas y pertenencia a la allowlist.
+    Devuelve None si es valida, o un mensaje de error si no lo es.
+    """
     partes = urlparse(url)
-    if partes.scheme not in ("http", "https"):
-        return f"esquema no permitido: {partes.scheme}"
-    if partes.hostname is None:
+
+    if partes.scheme not in politica.esquemas:
+        return f"esquema no permitido por la politica: {partes.scheme}"
+
+    if partes.username is not None or partes.password is not None:
+        return "no se permiten credenciales embebidas en la URL"
+
+    host = partes.hostname
+    if host is None:
         return "no se pudo determinar el host de la URL"
+
+    if not politica.host_permitido(host):
+        return "destino fuera de la lista de hosts permitidos"
+
     return None
 
 
@@ -88,22 +163,29 @@ class TransporteIPFija(httpx.AsyncHTTPTransport):
         request.url = request.url.copy_with(host=self.ip_destino)
         return await super().handle_async_request(request)
 
+# Dependencias activas del servidor. En produccion son las reales.
+# El host de prueba las reemplaza para correr sin DNS ni red externa.
+RESOLVER_ACTIVO: Resolver = resolver_todas_las_ips
+TRANSPORTE_ACTIVO: FabricaTransporte = TransporteIPFija
+
 
 async def obtener_contenido(
     url: str,
+    politica: PoliticaEgreso,
     resolver: Resolver = resolver_todas_las_ips,
     crear_transporte: FabricaTransporte = TransporteIPFija,
 ) -> str:
     """
-    Logica central de la tool, con sus dependencias inyectables.
-    En produccion se usan los valores por defecto; en las pruebas se
-    inyectan un resolver falso y una fabrica de transporte controlada.
+    Logica central de la tool. La politica es obligatoria: sin ella
+    la tool no opera (se valida antes de llamar a esta funcion).
     """
     url_actual = url
     saltos = 0
+    max_saltos = politica.limites["max_saltos"]
+    timeout_peticion = politica.limites["timeout_peticion_s"]
 
     while True:
-        error = validar_esquema(url_actual)
+        error = validar_url_contra_politica(url_actual, politica)
         if error is not None:
             return f"ERROR: {error}"
 
@@ -111,11 +193,12 @@ async def obtener_contenido(
         ip_validada, error = resolver_ip_segura(host, resolver)
         if error is not None:
             return f"ERROR: {error}"
-        # el transporte se construye llamando a crear_transporte
-        # con la ip validada
+
         try:
             async with httpx.AsyncClient(
-                transport=crear_transporte(ip_validada), follow_redirects=False
+                transport=crear_transporte(ip_validada),
+                follow_redirects=False,
+                timeout=timeout_peticion,
             ) as client:
                 response = await client.get(url_actual)
         except httpx.HTTPError:
@@ -123,8 +206,8 @@ async def obtener_contenido(
 
         if response.is_redirect:
             saltos += 1
-            if saltos > MAX_REDIRECCIONES:
-                return f"ERROR: demasiadas redirecciones (limite: {MAX_REDIRECCIONES})"
+            if saltos > max_saltos:
+                return f"ERROR: demasiadas redirecciones (limite: {max_saltos})"
 
             location = response.headers.get("location")
             if not location:
@@ -133,20 +216,65 @@ async def obtener_contenido(
             url_actual = urljoin(url_actual, location)
             continue
 
-        return response.text
+        texto = response.text
+        max_chars = politica.limites["max_chars_devueltos"]
+        if len(texto) > max_chars:
+            texto = texto[:max_chars]
+        return texto
 
-# la tool mcp como envoltorio 
-@mcp.tool()
-async def obtener_contenido_web(url: str) -> str:
+def leer_cabecera_politica(ctx) -> str | None:
+    """Lee X-LeIA-Egress-Policy de la peticion MCP, si esta presente."""
+    try:
+        request = ctx.request_context.request
+        if request is None:
+            return None
+        return request.headers.get("x-leia-egress-policy")
+    except (AttributeError, ValueError):
+        return None
+
+# reemplace el decorador @mcp.tool por esto:
+
+async def obtener_contenido_web(url: str, ctx: Context) -> str:
     """
     Trae el contenido de texto de una URL publica.
 
-    Rechaza destinos internos o privados de la red, incluidos los
-    alcanzados por redirecciones (cada salto se valida antes de seguirlo,
-    con un maximo de saltos). Cada host se resuelve una sola vez y la
-    conexion queda fijada a esa IP validada, para prevenir DNS rebinding.
+    Requiere que quien la invoque declare una politica de salida en la
+    cabecera X-LeIA-Egress-Policy (JSON inline). Sin politica, la tool
+    no opera.
+
+    Rechaza destinos fuera de la allowlist declarada, y destinos internos
+    o privados de la red, incluidos los alcanzados por redirecciones.
+    Cada host se resuelve una sola vez y la conexion queda fijada a esa
+    IP validada, para prevenir DNS rebinding.
+
+    No garantiza ritmo maximo hacia un mismo destino ni limite de pedidos
+    simultaneos: son garantias del gateway, no de esta tool.
     """
-    return await obtener_contenido(url)
+    cabecera = leer_cabecera_politica(ctx)
+
+    try:
+        politica = PoliticaEgreso.desde_json(cabecera)
+    except PoliticaInvalida as e:
+        return f"ERROR: {e}"
+
+    return await obtener_contenido(url, politica, RESOLVER_ACTIVO, TRANSPORTE_ACTIVO)
+
+
+def crear_servidor_mcp() -> FastMCP:
+    """
+    Fabrica una instancia nueva del servidor MCP con la tool registrada.
+
+    Cada instancia solo puede levantarse una vez (limitacion del
+    StreamableHTTPSessionManager del SDK), por eso el host de prueba
+    necesita una instancia propia por cada servidor que levanta.
+    """
+    instancia = FastMCP("mcp-web", stateless_http=True)
+    instancia.tool()(obtener_contenido_web)
+    return instancia
+
+
+mcp = crear_servidor_mcp()
+
 
 
 if __name__ == "__main__":
