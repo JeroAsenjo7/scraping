@@ -6,6 +6,8 @@ import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
 
+import pytest
+
 import httpx
 
 import json
@@ -16,6 +18,7 @@ from server import (
     TransporteIPFija,
     PoliticaEgreso,
     PoliticaInvalida,
+    ErrorEgreso,
 )
 
 def politica(hosts, **extra):
@@ -114,6 +117,12 @@ class RedSimulada:
 def ejecutar(coro):
     return asyncio.run(coro)
 
+def esperar_bloqueo(coro) -> ErrorEgreso:
+    """Ejecuta la corrutina esperando que levante ErrorEgreso, y lo devuelve."""
+    with pytest.raises(ErrorEgreso) as exc:
+        ejecutar(coro)
+    return exc.value
+
 
 # ---------------------------------------------------------------------
 # Caso feliz
@@ -128,7 +137,7 @@ def test_caso_feliz_sitio_publico():
             f"http://sitio-publico.test:{puerto}/",
             politica(["sitio-publico.test"]), resolver, red.crear_transporte))
 
-    assert "CONTENIDO PUBLICO" in resultado
+    assert "CONTENIDO PUBLICO" in resultado.contenido
     assert red.ips_fijadas == [IP_PUBLICA_SIMULADA]
 
 
@@ -140,31 +149,31 @@ def test_ssrf_ip_literal_loopback():
     pedidos = []
     with servidor_local(crear_handler(pedidos, cuerpo="PANEL INTERNO")) as puerto:
         red = RedSimulada()
-        resultado = ejecutar(obtener_contenido(
+        error = esperar_bloqueo(obtener_contenido(
             f"http://127.0.0.1:{puerto}/",
             politica(["127.0.0.1"]), crear_resolver({}), red.crear_transporte))
 
-    assert resultado.startswith("ERROR")
-    assert pedidos == []          # el servidor interno nunca fue contactado
-    assert red.ips_fijadas == []  # nunca se llego a conectar
+    assert error.codigo == "egress_bloqueado"
+    assert pedidos == []
+    assert red.ips_fijadas == []
 
 
 def test_ssrf_metadata_cloud():
     red = RedSimulada()
-    resultado = ejecutar(obtener_contenido(
+    error = esperar_bloqueo(obtener_contenido(
         "http://169.254.169.254/latest/meta-data/",
         politica(["169.254.169.254"]), crear_resolver({}), red.crear_transporte))
-    assert resultado.startswith("ERROR")
+    assert error.codigo == "egress_bloqueado"
     assert red.ips_fijadas == []
 
 
 def test_ssrf_dominio_que_resuelve_a_ip_privada():
     resolver = crear_resolver({"interno.test": ["10.0.0.5"]})
     red = RedSimulada()
-    resultado = ejecutar(obtener_contenido(
+    error = esperar_bloqueo(obtener_contenido(
         "http://interno.test/", politica(["interno.test"]),
         resolver, red.crear_transporte))
-    assert resultado.startswith("ERROR")
+    assert error.codigo == "egress_bloqueado"
     assert red.ips_fijadas == []
 
 
@@ -172,10 +181,10 @@ def test_dns_con_registros_mixtos_publico_e_interno():
     # §7.3: un dominio que devuelve una IP publica Y una interna a la vez
     resolver = crear_resolver({"mixto.test": [IP_PUBLICA_SIMULADA, "127.0.0.1"]})
     red = RedSimulada()
-    resultado = ejecutar(obtener_contenido(
+    error = esperar_bloqueo(obtener_contenido(
         "http://mixto.test/", politica(["mixto.test"]),
         resolver, red.crear_transporte))
-    assert resultado.startswith("ERROR")
+    assert error.codigo == "egress_bloqueado"
     assert red.ips_fijadas == []
 
 
@@ -191,14 +200,14 @@ def test_redireccion_hacia_interno_es_bloqueada():
         with servidor_local(crear_handler(pedidos_redirector, redirigir_a=destino)) as p_redir:
             resolver = crear_resolver({"sitio-publico.test": [IP_PUBLICA_SIMULADA]})
             red = RedSimulada()
-            resultado = ejecutar(obtener_contenido(
+            error = esperar_bloqueo(obtener_contenido(
                 f"http://sitio-publico.test:{p_redir}/",
                 politica(["sitio-publico.test"]), resolver, red.crear_transporte))
 
-    assert resultado.startswith("ERROR")
-    assert pedidos_redirector == ["/"]       # el primer salto si ocurrio
-    assert pedidos_interno == []             # el interno NUNCA fue contactado
-    assert red.ips_fijadas == [IP_PUBLICA_SIMULADA]  # solo se conecto al primer salto
+    assert error.codigo == "egress_bloqueado"
+    assert pedidos_redirector == ["/"]
+    assert pedidos_interno == []
+    assert red.ips_fijadas == [IP_PUBLICA_SIMULADA]
 
 
 def test_redireccion_hacia_dominio_que_resuelve_a_privada():
@@ -210,12 +219,12 @@ def test_redireccion_hacia_dominio_que_resuelve_a_privada():
             "interno.test": ["192.168.1.10"],
         })
         red = RedSimulada()
-        resultado = ejecutar(obtener_contenido(
+        error = esperar_bloqueo(obtener_contenido(
             f"http://sitio-publico.test:{p_redir}/",
             politica(["sitio-publico.test", "interno.test"]),
             resolver, red.crear_transporte))
 
-    assert resultado.startswith("ERROR")
+    assert error.codigo == "egress_bloqueado"
     assert red.ips_fijadas == [IP_PUBLICA_SIMULADA]
 
 
@@ -234,8 +243,8 @@ def test_redireccion_legitima_se_sigue():
                 politica(["sitio-publico.test", "otro-publico.test"]),
                 resolver, red.crear_transporte))
 
-    assert "DESTINO FINAL" in resultado
-    assert len(red.ips_fijadas) == 2  # un salto validado y fijado por cada host
+    assert "DESTINO FINAL" in resultado.contenido
+    assert len(red.ips_fijadas) == 2
 
 
 def test_limite_de_redirecciones():
@@ -243,11 +252,12 @@ def test_limite_de_redirecciones():
     with servidor_local(crear_handler([], redirigir_a="/")) as p_redir:
         resolver = crear_resolver({"bucle.test": [IP_PUBLICA_SIMULADA]})
         red = RedSimulada()
-        resultado = ejecutar(obtener_contenido(
+        error = esperar_bloqueo(obtener_contenido(
             f"http://bucle.test:{p_redir}/",
             politica(["bucle.test"]), resolver, red.crear_transporte))
 
-    assert "demasiadas redirecciones" in resultado
+    assert "demasiadas redirecciones" in error.mensaje
+    assert error.codigo == "egress_bloqueado"
 
 
 # ---------------------------------------------------------------------
@@ -294,9 +304,9 @@ def test_rebinding_propuesta_resiste():
             f"http://atacante.test:{puerto}/",
             politica(["atacante.test"]), resolver, red.crear_transporte))
 
-    assert resolver.llamadas == ["atacante.test"]    # UNA sola consulta DNS
-    assert red.ips_fijadas == [IP_PUBLICA_SIMULADA]  # conecto a la IP validada
-    assert "CONTENIDO" in resultado
+    assert resolver.llamadas == ["atacante.test"]
+    assert red.ips_fijadas == [IP_PUBLICA_SIMULADA]
+    assert "CONTENIDO" in resultado.contenido
 
 
 # ---------------------------------------------------------------------
@@ -329,11 +339,11 @@ def test_host_fuera_de_allowlist_se_bloquea():
     with servidor_local(crear_handler(pedidos, cuerpo="NO DEBERIA LLEGAR")) as puerto:
         resolver = crear_resolver({"otro-sitio.test": [IP_PUBLICA_SIMULADA]})
         red = RedSimulada()
-        resultado = ejecutar(obtener_contenido(
+        error = esperar_bloqueo(obtener_contenido(
             f"http://otro-sitio.test:{puerto}/",
             politica(["sitio-permitido.test"]), resolver, red.crear_transporte))
 
-    assert resultado.startswith("ERROR")
+    assert error.codigo == "egress_bloqueado"
     assert pedidos == []
     assert red.ips_fijadas == []
 
@@ -341,11 +351,11 @@ def test_host_fuera_de_allowlist_se_bloquea():
 def test_subdominio_bloqueado_por_defecto():
     resolver = crear_resolver({"sub.sitio.test": [IP_PUBLICA_SIMULADA]})
     red = RedSimulada()
-    resultado = ejecutar(obtener_contenido(
+    error = esperar_bloqueo(obtener_contenido(
         "http://sub.sitio.test/", politica(["sitio.test"]),
         resolver, red.crear_transporte))
 
-    assert resultado.startswith("ERROR")
+    assert error.codigo == "egress_bloqueado"
     assert red.ips_fijadas == []
 
 
@@ -359,29 +369,29 @@ def test_subdominio_permitido_si_la_politica_lo_habilita():
             politica(["sitio.test"], incluir_subdominios=True),
             resolver, red.crear_transporte))
 
-    assert "CONTENIDO SUB" in resultado
+    assert "CONTENIDO SUB" in resultado.contenido
 
 
 def test_dominio_que_termina_parecido_no_pasa_como_subdominio():
     # "malsitio.test" NO es subdominio de "sitio.test"
     resolver = crear_resolver({"malsitio.test": [IP_PUBLICA_SIMULADA]})
     red = RedSimulada()
-    resultado = ejecutar(obtener_contenido(
+    error = esperar_bloqueo(obtener_contenido(
         "http://malsitio.test/", politica(["sitio.test"], incluir_subdominios=True),
         resolver, red.crear_transporte))
 
-    assert resultado.startswith("ERROR")
+    assert error.codigo == "egress_bloqueado"
     assert red.ips_fijadas == []
 
 
 def test_credenciales_embebidas_en_url_se_rechazan():
     resolver = crear_resolver({"sitio.test": [IP_PUBLICA_SIMULADA]})
     red = RedSimulada()
-    resultado = ejecutar(obtener_contenido(
+    error = esperar_bloqueo(obtener_contenido(
         "http://usuario:clave@sitio.test/", politica(["sitio.test"]),
         resolver, red.crear_transporte))
 
-    assert resultado.startswith("ERROR")
+    assert error.codigo == "egress_bloqueado"
     assert red.ips_fijadas == []
 
 
@@ -391,10 +401,10 @@ def test_esquema_fuera_de_politica_se_rechaza():
     # politica que solo admite https, pedido por http
     pol = PoliticaEgreso.desde_json(json.dumps({
         "hosts": ["sitio.test"], "esquemas": ["https"]}))
-    resultado = ejecutar(obtener_contenido(
+    error = esperar_bloqueo(obtener_contenido(
         "http://sitio.test/", pol, resolver, red.crear_transporte))
 
-    assert resultado.startswith("ERROR")
+    assert error.codigo == "egress_bloqueado"
     assert red.ips_fijadas == []
 
 
@@ -408,4 +418,4 @@ def test_limite_de_caracteres_devueltos():
             politica(["sitio.test"], limites={"max_chars_devueltos": 100}),
             resolver, red.crear_transporte))
 
-    assert len(resultado) == 100
+    assert len(resultado.contenido) == 100

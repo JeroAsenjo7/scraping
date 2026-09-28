@@ -60,17 +60,43 @@ class HostDePrueba:
             resultado = await session.list_tools()
             return [t.name for t in resultado.tools]
 
-    async def invocar(self, url: str, politica=None) -> str:
+    async def invocar(self, url: str, politica=None) -> dict:
         """
-        Invoca obtener_contenido_web por MCP. 'politica' puede ser un dict
-        (se serializa a JSON), un string crudo, o None para no mandar la
-        cabecera en absoluto.
+        Invoca obtener_contenido_web por MCP y devuelve la salida
+        estructurada como dict. Si la tool devolvio un error, levanta
+        RuntimeError con el mensaje.
+        """
+        resultado, error = await self._llamar(url, politica)
+        if error is not None:
+            raise RuntimeError(error)
+        return resultado
+
+    async def invocar_esperando_error(self, url: str, politica=None) -> str:
+        """
+        Invoca la tool esperando que falle, y devuelve el mensaje de error.
+        Si la invocacion tiene exito, levanta AssertionError.
+        """
+        _, error = await self._llamar(url, politica)
+        if error is None:
+            raise AssertionError("se esperaba un error y la tool respondio bien")
+        return error
+
+    async def _llamar(self, url: str, politica) -> tuple[dict | None, str | None]:
+        """
+        Invoca la tool y devuelve (resultado, error). Nunca levanta por un
+        error de la tool: si levantara dentro de la sesion MCP, los task
+        groups de anyio lo envolverian en un ExceptionGroup y quien llama
+        no podria capturarlo por tipo.
         """
         async with self._sesion(politica) as session:
             resultado = await session.call_tool(
                 "obtener_contenido_web", arguments={"url": url}
             )
-            return resultado.content[0].text
+            if resultado.isError:
+                return None, resultado.content[0].text
+            if resultado.structuredContent is not None:
+                return resultado.structuredContent, None
+            return json.loads(resultado.content[0].text), None
 
 
 @contextlib.contextmanager

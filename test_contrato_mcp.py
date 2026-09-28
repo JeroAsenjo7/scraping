@@ -5,6 +5,8 @@ Verifica la regla de aceptacion de §6.3.4.
 import asyncio
 import json
 
+import pytest
+
 from host_prueba import HostDePrueba, servidor_mcp_en_proceso
 from test_ataques import (
     IP_PUBLICA_SIMULADA,
@@ -42,34 +44,38 @@ def test_mcp_con_politica_completa():
             resultado = ejecutar(host.invocar(
                 f"http://sitio-publico.test:{p_web}/", politica=POLITICA_BASE))
 
-    assert "CONTENIDO OK" in resultado
+    assert "CONTENIDO OK" in resultado["contenido"]
+    assert resultado["procedencia"]["politica_aplicada"] == POLITICA_BASE
+    assert resultado["procedencia"]["sha256"]
     assert red.ips_fijadas == [IP_PUBLICA_SIMULADA]
 
 
 def test_mcp_sin_politica_falla_cerrada():
     with servidor_mcp_en_proceso() as puerto:
         host = HostDePrueba(puerto)
-        resultado = ejecutar(host.invocar("http://sitio-publico.test/", politica=None))
+        error = ejecutar(host.invocar_esperando_error(
+            "http://sitio-publico.test/", politica=None))
 
-    assert "no declarada" in resultado
+    assert "egress_bloqueado" in error
+    assert "no declarada" in error
 
 
 def test_mcp_politica_vacia_se_distingue():
     with servidor_mcp_en_proceso() as puerto:
         host = HostDePrueba(puerto)
-        resultado = ejecutar(host.invocar(
+        error = ejecutar(host.invocar_esperando_error(
             "http://sitio-publico.test/", politica={"hosts": []}))
 
-    assert "sin destinos permitidos" in resultado
+    assert "sin destinos permitidos" in error
 
 
 def test_mcp_politica_mal_formada():
     with servidor_mcp_en_proceso() as puerto:
         host = HostDePrueba(puerto)
-        resultado = ejecutar(host.invocar(
+        error = ejecutar(host.invocar_esperando_error(
             "http://sitio-publico.test/", politica="no soy json"))
 
-    assert "mal formada" in resultado
+    assert "mal formada" in error
 
 
 def test_mcp_destino_interno_bloqueado():
@@ -79,10 +85,10 @@ def test_mcp_destino_interno_bloqueado():
         red = RedSimulada()
         with servidor_mcp_en_proceso(resolver, red.crear_transporte) as p_mcp:
             host = HostDePrueba(p_mcp)
-            resultado = ejecutar(host.invocar(
+            error = ejecutar(host.invocar_esperando_error(
                 f"http://sitio-publico.test:{p_web}/", politica=POLITICA_BASE))
 
-    assert resultado.startswith("ERROR")
+    assert "egress_bloqueado" in error
     assert pedidos == []
     assert red.ips_fijadas == []
 
@@ -92,11 +98,26 @@ def test_mcp_host_fuera_de_allowlist():
     red = RedSimulada()
     with servidor_mcp_en_proceso(resolver, red.crear_transporte) as p_mcp:
         host = HostDePrueba(p_mcp)
-        resultado = ejecutar(host.invocar(
+        error = ejecutar(host.invocar_esperando_error(
             "http://otro-sitio.test/", politica=POLITICA_BASE))
 
-    assert resultado.startswith("ERROR")
+    assert "egress_bloqueado" in error
     assert red.ips_fijadas == []
+
+
+def test_mcp_error_no_enumera_la_allowlist():
+    """
+    §7.5: el mensaje de error vuelve al contexto del modelo y es superficie.
+    No debe entregar el mapa de hosts permitidos ni de rangos prohibidos.
+    """
+    resolver = crear_resolver({"otro-sitio.test": [IP_PUBLICA_SIMULADA]})
+    red = RedSimulada()
+    with servidor_mcp_en_proceso(resolver, red.crear_transporte) as p_mcp:
+        host = HostDePrueba(p_mcp)
+        error = ejecutar(host.invocar_esperando_error(
+            "http://otro-sitio.test/", politica=POLITICA_BASE))
+
+    assert "sitio-publico.test" not in error
 
 
 def test_mcp_sin_identidad_ni_tenant():
@@ -106,11 +127,11 @@ def test_mcp_sin_identidad_ni_tenant():
         resolver = crear_resolver({"sitio-publico.test": [IP_PUBLICA_SIMULADA]})
         red = RedSimulada()
         with servidor_mcp_en_proceso(resolver, red.crear_transporte) as p_mcp:
-            host = HostDePrueba(p_mcp)  # sin identidad ni tenant
+            host = HostDePrueba(p_mcp)
             resultado = ejecutar(host.invocar(
                 f"http://sitio-publico.test:{p_web}/", politica=POLITICA_BASE))
 
-    assert "CONTENIDO OK" in resultado
+    assert "CONTENIDO OK" in resultado["contenido"]
 
 
 def test_mcp_rebinding_resiste_por_protocolo():
@@ -127,4 +148,4 @@ def test_mcp_rebinding_resiste_por_protocolo():
 
     assert resolver.llamadas == ["sitio-publico.test"]
     assert red.ips_fijadas == [IP_PUBLICA_SIMULADA]
-    assert "CONTENIDO" in resultado
+    assert "CONTENIDO" in resultado["contenido"]
