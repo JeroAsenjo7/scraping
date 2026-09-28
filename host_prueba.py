@@ -60,6 +60,18 @@ class HostDePrueba:
             resultado = await session.list_tools()
             return [t.name for t in resultado.tools]
 
+    async def describir_tool(self, nombre: str, politica=None) -> dict:
+        """
+        Devuelve la declaracion completa de una tool tal como la ve el
+        gateway: nombre, descripcion, schemas, annotations y _meta.
+        """
+        async with self._sesion(politica) as session:
+            resultado = await session.list_tools()
+            for herramienta in resultado.tools:
+                if herramienta.name == nombre:
+                    return herramienta.model_dump(by_alias=True)
+        raise AssertionError(f"la tool {nombre} no esta registrada")
+
     async def invocar(self, url: str, politica=None) -> dict:
         """
         Invoca obtener_contenido_web por MCP y devuelve la salida

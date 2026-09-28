@@ -152,6 +152,12 @@ class ExtractorHTML(HTMLParser):
     un humano que revisa la pagina no lo ve, el modelo si. Quitarlo no
     elimina la inyeccion visible, pero si la forma mas barata de
     esconderla.
+
+    LIMITE CONOCIDO: solo detecta el ocultamiento declarado en el propio
+    elemento. NO detecta el declarado en una hoja de estilos y aplicado
+    por clase o id (<style>.x{display:none}</style> + <div class="x">),
+    porque resolver eso exige cascada CSS, es decir, parte de un motor
+    de renderizado. Ver test_limite_conocido_ocultamiento_por_hoja_de_estilos.
     """
 
     def __init__(self, url_base: str):

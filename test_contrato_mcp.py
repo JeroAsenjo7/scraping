@@ -149,3 +149,61 @@ def test_mcp_rebinding_resiste_por_protocolo():
     assert resolver.llamadas == ["sitio-publico.test"]
     assert red.ips_fijadas == [IP_PUBLICA_SIMULADA]
     assert "CONTENIDO" in resultado["contenido"]
+
+
+def test_mcp_declara_metadata_de_riesgo():
+    """
+    ADR-020 seccion 3: risk sigue siendo readonly (la tool no escribe
+    nada hacia adentro) y la capacidad de salida se declara aparte,
+    como flag ortogonal _meta.egress.
+    """
+    with servidor_mcp_en_proceso() as puerto:
+        host = HostDePrueba(puerto)
+        tool = ejecutar(host.describir_tool("obtener_contenido_web"))
+
+    assert tool["_meta"]["risk"] == "readonly"
+    assert tool["_meta"]["egress"] is True
+
+
+def test_mcp_declara_annotations_estandar():
+    """§6.3.1: metadata de riesgo coherente con las annotations de MCP."""
+    with servidor_mcp_en_proceso() as puerto:
+        host = HostDePrueba(puerto)
+        tool = ejecutar(host.describir_tool("obtener_contenido_web"))
+
+    assert tool["annotations"]["readOnlyHint"] is True
+    assert tool["annotations"]["destructiveHint"] is False
+
+def test_mcp_que_le_llega_al_host_con_pagina_inyectada():
+    """
+    Entregable (a): caso de pagina con instrucciones escondidas dirigidas
+    al agente, verificando que le llega al host de prueba.
+
+    Lo oculto no llega. Lo visible si, marcado como no confiable en el
+    schema: la tool no puede decidir que texto es una instruccion
+    maliciosa, y no le corresponde intentarlo (§5.2).
+    """
+    from test_ataques import PAGINA_CON_INYECCION, crear_handler_html
+
+    with servidor_local(crear_handler_html([], PAGINA_CON_INYECCION)) as p_web:
+        resolver = crear_resolver({"sitio-publico.test": [IP_PUBLICA_SIMULADA]})
+        red = RedSimulada()
+        with servidor_mcp_en_proceso(resolver, red.crear_transporte) as p_mcp:
+            host = HostDePrueba(p_mcp)
+            resultado = ejecutar(host.invocar(
+                f"http://sitio-publico.test:{p_web}/", politica=POLITICA_BASE))
+
+    contenido = resultado["contenido"]
+    assert "INYECCION DISPLAY NONE" not in contenido
+    assert "INSTRUCCION EN SCRIPT" not in contenido
+    assert "Cuotas medico asistenciales" in contenido
+
+    # La procedencia viaja completa, para la auditoria del arnes
+    proc = resultado["procedencia"]
+    assert proc["sha256"]
+    assert proc["url_efectiva"]
+    assert proc["politica_aplicada"] == POLITICA_BASE
+
+    # Los enlaces se listan, sin seguirse
+    assert any(l["es_archivo"] for l in resultado["links"])
+    assert red.ips_fijadas == [IP_PUBLICA_SIMULADA]
