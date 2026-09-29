@@ -17,7 +17,8 @@ import ipaddress
 from dataclasses import dataclass, field
 import json 
 from mcp.server.fastmcp import FastMCP, Context
-
+#robots.txt
+from urllib.robotparser import RobotFileParser
 
 # Valores por defecto de los limites, usados solo si la politica
 # declarada no especifica alguno. No hay default para 'hosts':
@@ -54,6 +55,7 @@ class PoliticaEgreso:
     esquemas: list[str] = field(default_factory=lambda: ["https"])
     puertos: list[int] = field(default_factory=lambda: list(PUERTOS_POR_DEFECTO))
     tipos: list[str] = field(default_factory=lambda: list(TIPOS_POR_DEFECTO))
+    respetar_robots: bool = True
     limites: dict = field(default_factory=lambda: dict(LIMITES_POR_DEFECTO))
     derivadas: dict = field(default_factory=lambda: {"seguir": False,
                                                     "solo_misma_allowlist": True})
@@ -85,6 +87,7 @@ class PoliticaEgreso:
             esquemas=datos.get("esquemas") or ["https"],
             puertos=datos.get("puertos") or list(PUERTOS_POR_DEFECTO),
             tipos=datos.get("tipos") or list(TIPOS_POR_DEFECTO),
+            respetar_robots=bool(datos.get("respetar_robots", True)),
             limites=limites,
             derivadas=datos.get("derivadas") or {"seguir": False,
                                                  "solo_misma_allowlist": True},
@@ -375,6 +378,54 @@ def filtrar_links_derivados(
     return list(links)
 
 
+async def robots_permite(
+    url: str,
+    ip_validada: str,
+    crear_transporte: FabricaTransporte,
+    timeout: float,
+) -> bool:
+    """
+    Consulta robots.txt del host y decide si la URL es accesible (§6.2).
+
+    No es una defensa de seguridad: es una perilla operativa. Que el
+    sitio de destino bloquee nuestra direccion es un riesgo real para
+    el sistema destino, que depende de una fuente oficial unica.
+
+    FALLA ABIERTA a proposito, al reves que el resto de la tool: si
+    robots.txt no existe, no responde o no se puede interpretar, se
+    continua. El estandar dice que la ausencia del archivo significa
+    "todo permitido", y fallar cerrada volveria inaccesible cualquier
+    sitio sin robots.txt, que es el caso normal.
+
+    Usa la MISMA IP ya validada que el pedido principal, por el mismo
+    transporte: no vuelve a resolver el host (§7.3).
+    """
+    partes = urlparse(url)
+    url_robots = f"{partes.scheme}://{partes.netloc}/robots.txt"
+
+    try:
+        async with httpx.AsyncClient(
+            transport=crear_transporte(ip_validada),
+            follow_redirects=False,
+            timeout=timeout,
+        ) as client:
+            respuesta = await client.get(
+                url_robots, headers={"User-Agent": USER_AGENT})
+    except httpx.HTTPError:
+        return True  # no se pudo consultar: se continua
+
+    if respuesta.status_code != 200:
+        return True  # no hay robots.txt (404) o el sitio fallo (5xx)
+
+    parser = RobotFileParser()
+    try:
+        parser.parse(respuesta.text.splitlines())
+    except Exception:
+        return True  # robots.txt ilegible: se continua
+
+    return parser.can_fetch(USER_AGENT, url)
+
+
 class TransporteIPFija(httpx.AsyncHTTPTransport):
     """
     Fuerza la conexion a una IP ya validada (defensa contra rebinding).
@@ -463,6 +514,17 @@ async def obtener_contenido(
         ip_validada, error = resolver_ip_segura(host, resolver)
         if error is not None:
             raise ErrorEgreso("egress_bloqueado", error)
+
+        # robots.txt se consulta con la IP YA validada, por el mismo
+        # transporte: resolver el host de nuevo reabriria la ventana
+        # de rebinding que cierra §7.3.
+        if politica.respetar_robots:
+            permitido = await robots_permite(
+                url_actual, ip_validada, crear_transporte, timeout_peticion)
+            if not permitido:
+                raise ErrorEgreso(
+                    "egress_bloqueado",
+                    "el sitio no permite el acceso a esa ruta por robots.txt")
 
         try:
             async with httpx.AsyncClient(

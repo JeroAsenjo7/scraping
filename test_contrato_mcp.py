@@ -36,7 +36,7 @@ def politica_base(puerto=None, **extra):
     if puerto is not None:
         puertos.append(puerto)
     datos = {"hosts": ["sitio-publico.test"], "esquemas": ["http", "https"],
-             "puertos": puertos}
+             "puertos": puertos, "respetar_robots": False}
     datos.update(extra)
     return datos
 

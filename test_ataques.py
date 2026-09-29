@@ -25,6 +25,10 @@ def politica(hosts, puerto=None, **extra):
     """
     Arma una politica de prueba a partir de la lista de hosts permitidos.
 
+    respetar_robots viene en False por defecto: la consulta a robots.txt
+    agrega un pedido por invocacion y los tests que cuentan conexiones
+    miden otra cosa. Los tests de robots lo activan explicitamente.
+
     Los servidores de prueba corren en puertos efimeros, asi que cuando
     el caso levanta uno se le pasa su puerto. La politica no puede
     enumerar todos los puertos: viaja como cabecera HTTP y una lista
@@ -33,7 +37,8 @@ def politica(hosts, puerto=None, **extra):
     puertos = [80, 443]
     if puerto is not None:
         puertos.append(puerto)
-    datos = {"hosts": hosts, "esquemas": ["http", "https"], "puertos": puertos}
+    datos = {"hosts": hosts, "esquemas": ["http", "https"], "puertos": puertos,
+             "respetar_robots": False}
     datos.update(extra)
     return PoliticaEgreso.desde_json(json.dumps(datos))
 
@@ -754,3 +759,133 @@ def test_user_agent_propio_se_envia():
 
     assert agentes == [USER_AGENT]
 
+
+# ---------------------------------------------------------------------
+# robots.txt (§6.2)
+# ---------------------------------------------------------------------
+
+def crear_handler_con_robots(registro: list, robots: str | None,
+                             cuerpo: str = "CONTENIDO"):
+    """
+    Handler que sirve /robots.txt y cualquier otra ruta.
+    robots=None simula que el archivo no existe (404).
+    """
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            registro.append(self.path)
+            if self.path == "/robots.txt":
+                if robots is None:
+                    self.send_response(404)
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    return
+                datos = robots.encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "text/plain")
+                self.send_header("Content-Length", str(len(datos)))
+                self.end_headers()
+                self.wfile.write(datos)
+                return
+            datos = cuerpo.encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain")
+            self.send_header("Content-Length", str(len(datos)))
+            self.end_headers()
+            self.wfile.write(datos)
+
+        def log_message(self, *args):
+            pass
+
+    return Handler
+
+
+def test_robots_prohibe_la_ruta():
+    """Una ruta prohibida por robots.txt se rechaza."""
+    pedidos = []
+    robots = "User-agent: *\nDisallow: /privado/\n"
+    with servidor_local(crear_handler_con_robots(pedidos, robots)) as puerto:
+        resolver = crear_resolver({"sitio.test": [IP_PUBLICA_SIMULADA]})
+        red = RedSimulada()
+        error = esperar_bloqueo(obtener_contenido(
+            f"http://sitio.test:{puerto}/privado/datos",
+            politica(["sitio.test"], puerto, respetar_robots=True),
+            resolver, red.crear_transporte))
+
+    assert error.codigo == "egress_bloqueado"
+    assert "robots.txt" in error.mensaje
+    # Se consulto robots.txt, pero NO la ruta prohibida
+    assert pedidos == ["/robots.txt"]
+
+
+def test_robots_permite_otras_rutas():
+    """Lo que robots.txt no prohibe se trae normalmente."""
+    pedidos = []
+    robots = "User-agent: *\nDisallow: /privado/\n"
+    with servidor_local(crear_handler_con_robots(pedidos, robots)) as puerto:
+        resolver = crear_resolver({"sitio.test": [IP_PUBLICA_SIMULADA]})
+        red = RedSimulada()
+        resultado = ejecutar(obtener_contenido(
+            f"http://sitio.test:{puerto}/publico/datos",
+            politica(["sitio.test"], puerto, respetar_robots=True),
+            resolver, red.crear_transporte))
+
+    assert "CONTENIDO" in resultado.contenido
+    assert pedidos == ["/robots.txt", "/publico/datos"]
+
+
+def test_robots_ausente_no_bloquea():
+    """
+    Falla ABIERTA a proposito: sin robots.txt, el estandar dice que
+    todo esta permitido. Fallar cerrada volveria inaccesible cualquier
+    sitio que no publique el archivo, que es el caso normal.
+    """
+    pedidos = []
+    with servidor_local(crear_handler_con_robots(pedidos, None)) as puerto:
+        resolver = crear_resolver({"sitio.test": [IP_PUBLICA_SIMULADA]})
+        red = RedSimulada()
+        resultado = ejecutar(obtener_contenido(
+            f"http://sitio.test:{puerto}/cualquier/ruta",
+            politica(["sitio.test"], puerto, respetar_robots=True),
+            resolver, red.crear_transporte))
+
+    assert "CONTENIDO" in resultado.contenido
+
+
+def test_robots_se_puede_desactivar_por_politica():
+    """La perilla es configurable: respetar_robots=false la apaga."""
+    pedidos = []
+    robots = "User-agent: *\nDisallow: /\n"
+    with servidor_local(crear_handler_con_robots(pedidos, robots)) as puerto:
+        resolver = crear_resolver({"sitio.test": [IP_PUBLICA_SIMULADA]})
+        red = RedSimulada()
+        resultado = ejecutar(obtener_contenido(
+            f"http://sitio.test:{puerto}/algo",
+            politica(["sitio.test"], puerto, respetar_robots=False),
+            resolver, red.crear_transporte))
+
+    assert "CONTENIDO" in resultado.contenido
+    # No se consulto robots.txt en absoluto
+    assert pedidos == ["/algo"]
+
+
+def test_robots_cuesta_un_pedido_extra_por_invocacion():
+    """
+    HALLAZGO: el server es stateless, asi que no hay cache entre
+    invocaciones. Cada llamada paga un pedido adicional a robots.txt.
+    Este test documenta ese costo en vez de dejarlo implicito.
+    """
+    pedidos = []
+    robots = "User-agent: *\nDisallow: /privado/\n"
+    with servidor_local(crear_handler_con_robots(pedidos, robots)) as puerto:
+        resolver = crear_resolver({"sitio.test": [IP_PUBLICA_SIMULADA]})
+        red = RedSimulada()
+        for _ in range(3):
+            ejecutar(obtener_contenido(
+                f"http://sitio.test:{puerto}/publico",
+                politica(["sitio.test"], puerto, respetar_robots=True),
+                resolver, red.crear_transporte))
+
+    # 3 invocaciones = 6 pedidos: robots.txt no se cachea
+    assert pedidos.count("/robots.txt") == 3
+    assert pedidos.count("/publico") == 3
