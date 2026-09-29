@@ -21,9 +21,19 @@ from server import (
     ErrorEgreso,
 )
 
-def politica(hosts, **extra):
-    """Arma una politica de prueba a partir de la lista de hosts permitidos."""
-    datos = {"hosts": hosts, "esquemas": ["http", "https"]}
+def politica(hosts, puerto=None, **extra):
+    """
+    Arma una politica de prueba a partir de la lista de hosts permitidos.
+
+    Los servidores de prueba corren en puertos efimeros, asi que cuando
+    el caso levanta uno se le pasa su puerto. La politica no puede
+    enumerar todos los puertos: viaja como cabecera HTTP y una lista
+    larga hace que el servidor rechace el pedido con 400.
+    """
+    puertos = [80, 443]
+    if puerto is not None:
+        puertos.append(puerto)
+    datos = {"hosts": hosts, "esquemas": ["http", "https"], "puertos": puertos}
     datos.update(extra)
     return PoliticaEgreso.desde_json(json.dumps(datos))
 
@@ -153,7 +163,7 @@ def test_caso_feliz_sitio_publico():
         red = RedSimulada()
         resultado = ejecutar(obtener_contenido(
             f"http://sitio-publico.test:{puerto}/",
-            politica(["sitio-publico.test"]), resolver, red.crear_transporte))
+            politica(["sitio-publico.test"], puerto), resolver, red.crear_transporte))
 
     assert "CONTENIDO PUBLICO" in resultado.contenido
     assert red.ips_fijadas == [IP_PUBLICA_SIMULADA]
@@ -169,7 +179,7 @@ def test_ssrf_ip_literal_loopback():
         red = RedSimulada()
         error = esperar_bloqueo(obtener_contenido(
             f"http://127.0.0.1:{puerto}/",
-            politica(["127.0.0.1"]), crear_resolver({}), red.crear_transporte))
+            politica(["127.0.0.1"], puerto), crear_resolver({}), red.crear_transporte))
 
     assert error.codigo == "egress_bloqueado"
     assert pedidos == []
@@ -220,7 +230,9 @@ def test_redireccion_hacia_interno_es_bloqueada():
             red = RedSimulada()
             error = esperar_bloqueo(obtener_contenido(
                 f"http://sitio-publico.test:{p_redir}/",
-                politica(["sitio-publico.test"]), resolver, red.crear_transporte))
+                politica(["sitio-publico.test"], p_redir,
+                         puertos=[80, 443, p_redir, p_interno]),
+                resolver, red.crear_transporte))
 
     assert error.codigo == "egress_bloqueado"
     assert pedidos_redirector == ["/"]
@@ -239,7 +251,7 @@ def test_redireccion_hacia_dominio_que_resuelve_a_privada():
         red = RedSimulada()
         error = esperar_bloqueo(obtener_contenido(
             f"http://sitio-publico.test:{p_redir}/",
-            politica(["sitio-publico.test", "interno.test"]),
+            politica(["sitio-publico.test", "interno.test"], p_redir),
             resolver, red.crear_transporte))
 
     assert error.codigo == "egress_bloqueado"
@@ -258,7 +270,8 @@ def test_redireccion_legitima_se_sigue():
             red = RedSimulada()
             resultado = ejecutar(obtener_contenido(
                 f"http://sitio-publico.test:{p_redir}/",
-                politica(["sitio-publico.test", "otro-publico.test"]),
+                politica(["sitio-publico.test", "otro-publico.test"],
+                         puertos=[80, 443, p_redir, p_pub]),
                 resolver, red.crear_transporte))
 
     assert "DESTINO FINAL" in resultado.contenido
@@ -272,7 +285,7 @@ def test_limite_de_redirecciones():
         red = RedSimulada()
         error = esperar_bloqueo(obtener_contenido(
             f"http://bucle.test:{p_redir}/",
-            politica(["bucle.test"]), resolver, red.crear_transporte))
+            politica(["bucle.test"], p_redir), resolver, red.crear_transporte))
 
     assert "demasiadas redirecciones" in error.mensaje
     assert error.codigo == "egress_bloqueado"
@@ -320,7 +333,7 @@ def test_rebinding_propuesta_resiste():
         red = RedSimulada()
         resultado = ejecutar(obtener_contenido(
             f"http://atacante.test:{puerto}/",
-            politica(["atacante.test"]), resolver, red.crear_transporte))
+            politica(["atacante.test"], puerto), resolver, red.crear_transporte))
 
     assert resolver.llamadas == ["atacante.test"]
     assert red.ips_fijadas == [IP_PUBLICA_SIMULADA]
@@ -359,7 +372,7 @@ def test_host_fuera_de_allowlist_se_bloquea():
         red = RedSimulada()
         error = esperar_bloqueo(obtener_contenido(
             f"http://otro-sitio.test:{puerto}/",
-            politica(["sitio-permitido.test"]), resolver, red.crear_transporte))
+            politica(["sitio-permitido.test"], puerto), resolver, red.crear_transporte))
 
     assert error.codigo == "egress_bloqueado"
     assert pedidos == []
@@ -384,7 +397,7 @@ def test_subdominio_permitido_si_la_politica_lo_habilita():
         red = RedSimulada()
         resultado = ejecutar(obtener_contenido(
             f"http://sub.sitio.test:{puerto}/",
-            politica(["sitio.test"], incluir_subdominios=True),
+            politica(["sitio.test"], puerto, incluir_subdominios=True),
             resolver, red.crear_transporte))
 
     assert "CONTENIDO SUB" in resultado.contenido
@@ -433,7 +446,7 @@ def test_limite_de_caracteres_devueltos():
         red = RedSimulada()
         resultado = ejecutar(obtener_contenido(
             f"http://sitio.test:{puerto}/",
-            politica(["sitio.test"], limites={"max_chars_devueltos": 100}),
+            politica(["sitio.test"], puerto, limites={"max_chars_devueltos": 100}),
             resolver, red.crear_transporte))
 
     assert len(resultado.contenido) == 100
@@ -481,7 +494,7 @@ def test_inyeccion_oculta_por_estilo_en_linea_no_llega():
         red = RedSimulada()
         resultado = ejecutar(obtener_contenido(
             f"http://sitio-publico.test:{puerto}/",
-            politica(["sitio-publico.test"]), resolver, red.crear_transporte))
+            politica(["sitio-publico.test"], puerto), resolver, red.crear_transporte))
 
     contenido = resultado.contenido
     assert "INYECCION DISPLAY NONE" not in contenido
@@ -511,7 +524,7 @@ def test_limite_conocido_ocultamiento_por_hoja_de_estilos():
         red = RedSimulada()
         resultado = ejecutar(obtener_contenido(
             f"http://sitio-publico.test:{puerto}/",
-            politica(["sitio-publico.test"]), resolver, red.crear_transporte))
+            politica(["sitio-publico.test"], puerto), resolver, red.crear_transporte))
 
     assert "INYECCION POR CLASE" in resultado.contenido
 
@@ -523,7 +536,7 @@ def test_contenido_visible_si_se_conserva():
         red = RedSimulada()
         resultado = ejecutar(obtener_contenido(
             f"http://sitio-publico.test:{puerto}/",
-            politica(["sitio-publico.test"]), resolver, red.crear_transporte))
+            politica(["sitio-publico.test"], puerto), resolver, red.crear_transporte))
 
     assert "Cuotas medico asistenciales: 1.000.000" in resultado.contenido
     assert "Nota visible" in resultado.contenido
@@ -541,7 +554,7 @@ def test_links_se_listan_sin_seguirse():
             red = RedSimulada()
             resultado = ejecutar(obtener_contenido(
                 f"http://sitio-publico.test:{puerto}/",
-                politica(["sitio-publico.test"]), resolver, red.crear_transporte))
+            politica(["sitio-publico.test"], puerto), resolver, red.crear_transporte))
 
     urls = [l.url for l in resultado.links]
     assert any(u.endswith("/tabla.pdf") for u in urls)

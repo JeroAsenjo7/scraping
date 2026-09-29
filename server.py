@@ -31,6 +31,18 @@ LIMITES_POR_DEFECTO = {
     "max_chars_devueltos": 15_000,
 }
 
+# Identificacion propia hacia afuera (6.2). No es solo buena conducta:
+# que el sitio de destino bloquee nuestra direccion es un riesgo
+# operativo real.
+USER_AGENT = "LeIA-mcp-web/0.1 (+https://iconolabs.example/leia-web-tool)"
+
+# Puertos aceptados por defecto si la politica no los declara.
+PUERTOS_POR_DEFECTO = [80, 443]
+
+# Tipos de contenido aceptados por defecto (6.2).
+TIPOS_POR_DEFECTO = ["text/html", "text/plain", "application/xhtml+xml",
+                     "application/json", "text/xml", "application/xml"]
+
 class PoliticaInvalida(Exception):
     """La politica declarada esta ausente, mal formada o sin destinos."""
 
@@ -40,6 +52,8 @@ class PoliticaEgreso:
     hosts: list[str]
     incluir_subdominios: bool = False
     esquemas: list[str] = field(default_factory=lambda: ["https"])
+    puertos: list[int] = field(default_factory=lambda: list(PUERTOS_POR_DEFECTO))
+    tipos: list[str] = field(default_factory=lambda: list(TIPOS_POR_DEFECTO))
     limites: dict = field(default_factory=lambda: dict(LIMITES_POR_DEFECTO))
     derivadas: dict = field(default_factory=lambda: {"seguir": False,
                                                     "solo_misma_allowlist": True})
@@ -69,6 +83,8 @@ class PoliticaEgreso:
             hosts=[h.lower() for h in hosts],
             incluir_subdominios=bool(datos.get("incluir_subdominios", False)),
             esquemas=datos.get("esquemas") or ["https"],
+            puertos=datos.get("puertos") or list(PUERTOS_POR_DEFECTO),
+            tipos=datos.get("tipos") or list(TIPOS_POR_DEFECTO),
             limites=limites,
             derivadas=datos.get("derivadas") or {"seguir": False,
                                                  "solo_misma_allowlist": True},
@@ -91,6 +107,10 @@ class Link(BaseModel):
     es_archivo: bool = Field(
         default=False,
         description="True si apunta a un archivo descargable (PDF, etc)")
+    seguible: bool = Field(
+        default=False,
+        description="True si la politica declarada permitiria seguirlo. "
+                    "La tool no lo sigue igual: solo informa")
 
 
 class Procedencia(BaseModel):
@@ -124,6 +144,29 @@ class ResultadoWeb(BaseModel):
     procedencia: Procedencia = Field(description="Trazabilidad del pedido")
 
 EXTENSIONES_ARCHIVO = (".pdf", ".doc", ".docx", ".xls", ".xlsx", ".zip", ".csv")
+
+
+
+# Firmas de formatos binarios: si el cuerpo empieza asi, no es texto
+# por mas que el servidor declare text/html (6.2, 8).
+FIRMAS_BINARIAS = {
+    b"%PDF-": "PDF",
+    b"\x89PNG": "PNG",
+    b"GIF8": "GIF",
+    b"\xff\xd8\xff": "JPEG",
+    b"PK\x03\x04": "ZIP",
+    b"\x1f\x8b": "GZIP",
+    b"MZ": "ejecutable",
+    b"\x7fELF": "ELF",
+}
+
+
+def detectar_binario(crudo: bytes) -> str | None:
+    """Devuelve el formato si el contenido real es binario, o None."""
+    for firma, nombre in FIRMAS_BINARIAS.items():
+        if crudo.startswith(firma):
+            return nombre
+    return None
 
 # Etiquetas cuyo contenido nunca es texto visible para una persona
 ETIQUETAS_INVISIBLES = {"script", "style", "noscript", "template", "head"}
@@ -300,7 +343,36 @@ def validar_url_contra_politica(url: str, politica: PoliticaEgreso) -> str | Non
     if not politica.host_permitido(host):
         return "destino fuera de la lista de hosts permitidos"
 
+    puerto = partes.port
+    if puerto is None:
+        puerto = 443 if partes.scheme == "https" else 80
+    if puerto not in politica.puertos:
+        return "puerto no permitido por la politica"
+
     return None
+
+def filtrar_links_derivados(
+    links: list[Link], politica: PoliticaEgreso
+) -> list[Link]:
+    """
+    Marca que enlaces serian seguibles segun la politica (§5.1, §8).
+
+    Por defecto derivadas.seguir es False: ningun enlace hallado en el
+    contenido se sigue. Si la politica lo habilita con
+    solo_misma_allowlist, solo son seguibles los que ya estarian
+    permitidos por la propia allowlist.
+
+    Una URL derivada NO hereda la politica de la pagina de origen: la
+    politica es una sola, la que llego en la cabecera (ADR-020 §2).
+    """
+    if not politica.derivadas.get("seguir"):
+        return []
+
+    if politica.derivadas.get("solo_misma_allowlist", True):
+        return [e for e in links
+                if validar_url_contra_politica(e.url, politica) is None]
+
+    return list(links)
 
 
 class TransporteIPFija(httpx.AsyncHTTPTransport):
@@ -398,7 +470,11 @@ async def obtener_contenido(
                 follow_redirects=False,
                 timeout=timeout_peticion,
             ) as client:
-                async with client.stream("GET", url_actual) as response:
+                async with client.stream(
+                    "GET", url_actual,
+                    headers={"User-Agent": USER_AGENT,
+                             "Accept-Encoding": "gzip, deflate"},
+                ) as response:
                     if response.is_redirect:
                         crudo = b""
                     else:
@@ -424,13 +500,32 @@ async def obtener_contenido(
             continue
 
         huella = hashlib.sha256(crudo).hexdigest()
+
+        # El tipo declarado no es confiable: se verifica contra el
+        # contenido real antes de tratarlo como texto (§6.2, §8).
+        binario = detectar_binario(crudo)
+        if binario is not None:
+            raise ErrorEgreso(
+                "egress_bloqueado",
+                f"el contenido real es binario ({binario}), no texto")
+
+        tipo_declarado = (cabeceras.get("content-type") or "").split(";")[0].strip().lower()
+        if tipo_declarado and tipo_declarado not in politica.tipos:
+            raise ErrorEgreso(
+                "egress_bloqueado",
+                f"tipo de contenido no permitido: {tipo_declarado}")
+
         texto_crudo = crudo.decode("utf-8", errors="replace")
 
-        tipo = (cabeceras.get("content-type") or "").lower()
-        if "html" in tipo or texto_crudo.lstrip()[:200].lower().startswith(("<!doctype", "<html")):
+        if "html" in tipo_declarado or texto_crudo.lstrip()[:200].lower().startswith(
+                ("<!doctype", "<html")):
             texto, links = extraer(texto_crudo, url_actual)
         else:
             texto, links = texto_crudo, []
+
+        seguibles = {e.url for e in filtrar_links_derivados(links, politica)}
+        for enlace in links:
+            enlace.seguible = enlace.url in seguibles
 
         max_chars = politica.limites["max_chars_devueltos"]
         if len(texto) > max_chars:
