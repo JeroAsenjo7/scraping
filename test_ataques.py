@@ -889,3 +889,65 @@ def test_robots_cuesta_un_pedido_extra_por_invocacion():
     # 3 invocaciones = 6 pedidos: robots.txt no se cachea
     assert pedidos.count("/robots.txt") == 3
     assert pedidos.count("/publico") == 3
+
+
+# ---------------------------------------------------------------------
+# Dominio permitido que resuelve a IP prohibida (§6.2)
+# ---------------------------------------------------------------------
+
+def test_host_en_allowlist_que_resuelve_a_interna_se_rechaza():
+    """
+    §6.2: que hacer cuando un dominio permitido resuelve a una direccion
+    prohibida. DECISION: se rechaza, la allowlist de hosts no sobreescribe
+    la validacion de IP. Estar en la allowlist no es una excepcion a las
+    reglas de destino: son dos capas que se aplican en serie.
+    """
+    pedidos = []
+    with servidor_local(crear_handler(pedidos, cuerpo="PANEL INTERNO")) as puerto:
+        # sitio.test SI esta en la allowlist, pero resuelve a loopback
+        resolver = crear_resolver({"sitio.test": ["127.0.0.1"]})
+        red = RedSimulada()
+        error = esperar_bloqueo(obtener_contenido(
+            f"http://sitio.test:{puerto}/",
+            politica(["sitio.test"], puerto), resolver, red.crear_transporte))
+
+    assert error.codigo == "egress_bloqueado"
+    assert pedidos == []
+    assert red.ips_fijadas == []
+
+
+def test_host_con_una_ip_mala_se_rechaza_entero():
+    """
+    DECISION: si alguna IP del host es interna, se rechaza el host
+    completo; no se filtra la mala y se usa una buena.
+
+    Un dominio permitido que apunta a la red interna es una senal de que
+    algo anda mal (dominio comprometido, error de configuracion, intento
+    de rebinding). Conectarse igual seria tratar una anomalia como si
+    fuera normal, y ademas deja al atacante elegir cuando aparece la IP
+    buena y cuando la mala.
+    """
+    resolver = crear_resolver({
+        "sitio.test": [IP_PUBLICA_SIMULADA, "10.0.0.7", "93.184.216.35"]})
+    red = RedSimulada()
+    error = esperar_bloqueo(obtener_contenido(
+        "http://sitio.test/", politica(["sitio.test"]),
+        resolver, red.crear_transporte))
+
+    assert error.codigo == "egress_bloqueado"
+    assert red.ips_fijadas == []
+
+
+def test_error_no_revela_la_ip_resuelta():
+    """
+    §7.5: el mensaje vuelve al contexto del modelo y es superficie. Decir
+    que el host resolvio a 10.0.0.7 le entrega al atacante un dato de la
+    topologia interna que no tenia.
+    """
+    resolver = crear_resolver({"sitio.test": ["10.0.0.7"]})
+    red = RedSimulada()
+    error = esperar_bloqueo(obtener_contenido(
+        "http://sitio.test/", politica(["sitio.test"]),
+        resolver, red.crear_transporte))
+
+    assert "10.0.0.7" not in error.mensaje
