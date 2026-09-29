@@ -567,3 +567,190 @@ def test_links_se_listan_sin_seguirse():
     # Solo se conecto al sitio pedido: ningun enlace fue seguido
     assert red.ips_fijadas == [IP_PUBLICA_SIMULADA]
     assert pedidos_otro == []
+
+
+# ---------------------------------------------------------------------
+# Perillas de §6.2: puertos, tipo de contenido, URLs derivadas
+# ---------------------------------------------------------------------
+
+def test_puerto_fuera_de_politica_se_rechaza():
+    """
+    §6.2: puertos aceptados. Un host permitido puede exponer servicios
+    en puertos no previstos; la allowlist de hosts sola no lo cubre.
+    """
+    pedidos = []
+    with servidor_local(crear_handler(pedidos, cuerpo="NO DEBERIA LLEGAR")) as puerto:
+        resolver = crear_resolver({"sitio.test": [IP_PUBLICA_SIMULADA]})
+        red = RedSimulada()
+        # La politica solo admite 80 y 443: el puerto efimero no esta
+        error = esperar_bloqueo(obtener_contenido(
+            f"http://sitio.test:{puerto}/",
+            politica(["sitio.test"]), resolver, red.crear_transporte))
+
+    assert error.codigo == "egress_bloqueado"
+    assert pedidos == []
+    assert red.ips_fijadas == []
+
+
+def test_puerto_implicito_se_deriva_del_esquema():
+    """Una URL sin puerto usa 80 para http y 443 para https."""
+    resolver = crear_resolver({"sitio.test": [IP_PUBLICA_SIMULADA]})
+    red = RedSimulada()
+    pol = PoliticaEgreso.desde_json(json.dumps({
+        "hosts": ["sitio.test"], "esquemas": ["http", "https"],
+        "puertos": [443]}))
+    # http implica puerto 80, que no esta en la politica
+    error = esperar_bloqueo(obtener_contenido(
+        "http://sitio.test/", pol, resolver, red.crear_transporte))
+
+    assert error.codigo == "egress_bloqueado"
+    assert red.ips_fijadas == []
+
+
+def test_tipo_de_contenido_fuera_de_politica_se_rechaza():
+    """§6.2: tipos de contenido aceptados."""
+    def crear_handler_tipo(tipo: str, cuerpo: str):
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                datos = cuerpo.encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", tipo)
+                self.send_header("Content-Length", str(len(datos)))
+                self.end_headers()
+                self.wfile.write(datos)
+
+            def log_message(self, *args):
+                pass
+        return Handler
+
+    with servidor_local(crear_handler_tipo("text/css", "body{}")) as puerto:
+        resolver = crear_resolver({"sitio.test": [IP_PUBLICA_SIMULADA]})
+        red = RedSimulada()
+        error = esperar_bloqueo(obtener_contenido(
+            f"http://sitio.test:{puerto}/",
+            politica(["sitio.test"], puerto), resolver, red.crear_transporte))
+
+    assert error.codigo == "egress_bloqueado"
+    assert "tipo de contenido" in error.mensaje
+
+
+def test_binario_declarado_como_html_se_detecta():
+    """
+    §8: el tipo declarado no es confiable. El servidor dice text/html
+    y manda un PDF; se verifica el contenido real, no lo declarado.
+    """
+    class HandlerMentiroso(BaseHTTPRequestHandler):
+        def do_GET(self):
+            # Firma de PDF, declarada como HTML
+            datos = b"%PDF-1.4\n%contenido binario falso"
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html")
+            self.send_header("Content-Length", str(len(datos)))
+            self.end_headers()
+            self.wfile.write(datos)
+
+        def log_message(self, *args):
+            pass
+
+    with servidor_local(HandlerMentiroso) as puerto:
+        resolver = crear_resolver({"sitio.test": [IP_PUBLICA_SIMULADA]})
+        red = RedSimulada()
+        error = esperar_bloqueo(obtener_contenido(
+            f"http://sitio.test:{puerto}/",
+            politica(["sitio.test"], puerto), resolver, red.crear_transporte))
+
+    assert error.codigo == "egress_bloqueado"
+    assert "binario" in error.mensaje
+    assert "PDF" in error.mensaje
+
+
+def test_derivadas_no_seguibles_por_defecto():
+    """
+    §5.1, cuarto origen: por defecto ningun enlace hallado en el
+    contenido es seguible. La tool los lista, marcados como no seguibles.
+    """
+    with servidor_local(crear_handler_html([], PAGINA_CON_INYECCION)) as puerto:
+        resolver = crear_resolver({"sitio-publico.test": [IP_PUBLICA_SIMULADA]})
+        red = RedSimulada()
+        resultado = ejecutar(obtener_contenido(
+            f"http://sitio-publico.test:{puerto}/",
+            politica(["sitio-publico.test"], puerto), resolver, red.crear_transporte))
+
+    assert resultado.links  # hay enlaces listados
+    assert all(not l.seguible for l in resultado.links)
+
+
+def test_derivadas_seguibles_solo_dentro_de_la_allowlist():
+    """
+    Si la politica habilita derivadas con solo_misma_allowlist, solo son
+    seguibles los enlaces que ya estarian permitidos por la allowlist.
+    La URL derivada NO hereda la politica de la pagina de origen.
+    """
+    with servidor_local(crear_handler_html([], PAGINA_CON_INYECCION)) as puerto:
+        resolver = crear_resolver({"sitio-publico.test": [IP_PUBLICA_SIMULADA]})
+        red = RedSimulada()
+        resultado = ejecutar(obtener_contenido(
+            f"http://sitio-publico.test:{puerto}/",
+            politica(["sitio-publico.test"], puerto,
+                     derivadas={"seguir": True, "solo_misma_allowlist": True}),
+            resolver, red.crear_transporte))
+
+    # El PDF es del mismo host y puerto: seguible
+    pdf = [l for l in resultado.links if l.url.endswith("/tabla.pdf")][0]
+    assert pdf.seguible
+
+    # otro-sitio.test no esta en la allowlist: no seguible
+    otro = [l for l in resultado.links if "otro-sitio.test" in l.url][0]
+    assert not otro.seguible
+
+
+def test_marcar_seguible_no_implica_seguirlo():
+    """
+    Decision de diseno: la tool informa que enlaces serian seguibles,
+    pero no los sigue. Quien invoca decide.
+    """
+    pedidos_pdf = []
+    with servidor_local(crear_handler(pedidos_pdf, cuerpo="TABLA PDF")):
+        with servidor_local(crear_handler_html([], PAGINA_CON_INYECCION)) as puerto:
+            resolver = crear_resolver({"sitio-publico.test": [IP_PUBLICA_SIMULADA]})
+            red = RedSimulada()
+            resultado = ejecutar(obtener_contenido(
+                f"http://sitio-publico.test:{puerto}/",
+                politica(["sitio-publico.test"], puerto,
+                         derivadas={"seguir": True, "solo_misma_allowlist": True}),
+                resolver, red.crear_transporte))
+
+    assert any(l.seguible for l in resultado.links)
+    # Una sola conexion: la de la pagina pedida
+    assert red.ips_fijadas == [IP_PUBLICA_SIMULADA]
+    assert pedidos_pdf == []
+
+
+def test_user_agent_propio_se_envia():
+    """§6.2: identificacion propia y reconocible hacia afuera."""
+    from server import USER_AGENT
+
+    agentes = []
+
+    class HandlerQueRegistra(BaseHTTPRequestHandler):
+        def do_GET(self):
+            agentes.append(self.headers.get("User-Agent"))
+            datos = b"OK"
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain")
+            self.send_header("Content-Length", str(len(datos)))
+            self.end_headers()
+            self.wfile.write(datos)
+
+        def log_message(self, *args):
+            pass
+
+    with servidor_local(HandlerQueRegistra) as puerto:
+        resolver = crear_resolver({"sitio.test": [IP_PUBLICA_SIMULADA]})
+        red = RedSimulada()
+        ejecutar(obtener_contenido(
+            f"http://sitio.test:{puerto}/",
+            politica(["sitio.test"], puerto), resolver, red.crear_transporte))
+
+    assert agentes == [USER_AGENT]
+
