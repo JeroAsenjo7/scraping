@@ -102,7 +102,7 @@ class HostDePrueba:
         """
         async with self._sesion(politica) as session:
             resultado = await session.call_tool(
-                "obtener_contenido_web", arguments={"url": url}
+                "obtener_contenido_web", arguments={"entrada": {"url": url}}
             )
             if resultado.isError:
                 return None, resultado.content[0].text

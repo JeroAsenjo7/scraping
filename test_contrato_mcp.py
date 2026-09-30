@@ -4,6 +4,7 @@ Verifica la regla de aceptacion de §6.3.4: el dia que la tool se
 incorpore al arnes, integrarla tiene que consistir en reemplazar el
 host de prueba por el gateway real, y nada mas.
 """
+import json
 import asyncio
 
 from host_prueba import HostDePrueba, servidor_mcp_en_proceso
@@ -254,3 +255,44 @@ def test_mcp_que_le_llega_al_host_con_pagina_inyectada():
     # Los enlaces se listan, sin seguirse
     assert any(l["es_archivo"] for l in resultado["links"])
     assert red.ips_fijadas == [IP_PUBLICA_SIMULADA]
+
+def test_mcp_declara_schema_de_entrada_con_descripcion():
+    """
+    §6.3.1: schema de entrada (Pydantic) con descripcion por parametro.
+    Lo que el modelo lee sobre un parametro influye en como lo llena,
+    asi que es superficie de diseno (§5.4).
+    """
+    with servidor_mcp_en_proceso() as puerto:
+        host = HostDePrueba(puerto)
+        tool = ejecutar(host.describir_tool("obtener_contenido_web"))
+
+    schema = tool["inputSchema"]
+    assert "entrada" in schema["properties"]
+
+    # La descripcion del parametro url viaja en el schema
+    texto = json.dumps(schema)
+    assert "politica de salida" in texto
+    assert "credenciales embebidas" in texto
+
+
+def test_mcp_declara_schema_de_salida():
+    """§6.3.1: schema de salida declarado, no solo texto."""
+    with servidor_mcp_en_proceso() as puerto:
+        host = HostDePrueba(puerto)
+        tool = ejecutar(host.describir_tool("obtener_contenido_web"))
+
+    assert tool.get("outputSchema") is not None
+
+
+def test_mcp_descripcion_advierte_contenido_no_confiable():
+    """
+    §5.2: marcar el contenido de una forma que no se pueda ignorar.
+    La advertencia va en la descripcion de la tool y en el schema del
+    campo, por redundancia deliberada.
+    """
+    with servidor_mcp_en_proceso() as puerto:
+        host = HostDePrueba(puerto)
+        tool = ejecutar(host.describir_tool("obtener_contenido_web"))
+
+    assert "NO CONFIABLE" in tool["description"]
+    assert "NO GARANTIZA" in tool["description"]
